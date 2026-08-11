@@ -78,10 +78,14 @@ func (c *Command) SetErr(w io.Writer) {
 // ResetFlags). This is the fix for the flag-value-leak issue: it guarantees
 // execution isolation even when the same Command is executed repeatedly.
 func (c *Command) Execute() error {
-	// Reset flags before parsing on every execution after the first. The first
-	// run starts from defaults anyway; resetting here keeps behavior identical
-	// for single-execution CLIs (acceptance criterion 4).
-	c.ResetFlags()
+	// Reset flags before parsing only on executions after the first. The first
+	// execution preserves any programmatic flag values the caller set (e.g.
+	// Flags().Set("port", "9090") as a config-driven default); subsequent
+	// executions reset to defaults so a previous run's values never leak in.
+	if c.lastExecuted {
+		c.ResetFlags()
+	}
+	c.lastExecuted = true
 
 	// Resolve the target subcommand by walking args.
 	target := c
@@ -93,20 +97,26 @@ func (c *Command) Execute() error {
 		}
 	}
 
-	// Merge persistent flags from root down to target, then parse.
+	// Merge persistent flags from root down to target, then parse. Local flags
+	// shadow same-named persistent flags (real cobra semantics). pflag.AddFlag
+	// panics on duplicates, so dedupe by name with local winning.
 	flagSet := pflag.NewFlagSet(target.Use, pflag.ContinueOnError)
 	flagSet.SetOutput(target.err)
+	seen := make(map[string]struct{})
+	addFlag := func(f *pflag.Flag) {
+		if _, dup := seen[f.Name]; dup {
+			return
+		}
+		seen[f.Name] = struct{}{}
+		_ = flagSet.AddFlag(f)
+	}
 	for p := target; p != nil; p = p.parent {
 		if p.persistentFlags != nil {
-			p.persistentFlags.VisitAll(func(f *pflag.Flag) {
-				_ = flagSet.AddFlag(f)
-			})
+			p.persistentFlags.VisitAll(addFlag)
 		}
 	}
 	if target.flags != nil {
-		target.flags.VisitAll(func(f *pflag.Flag) {
-			_ = flagSet.AddFlag(f)
-		})
+		target.flags.VisitAll(addFlag)
 	}
 
 	var positional []string
